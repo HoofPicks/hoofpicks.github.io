@@ -46,6 +46,59 @@ function ensureSignedIn() {
 const drawRef = code => doc(db, 'draws', code.toUpperCase());
 const entriesCol = code => collection(db, 'draws', code.toUpperCase(), 'entries');
 const entryRef = (code, number) => doc(db, 'draws', code.toUpperCase(), 'entries', String(number));
+const tokenRef = uid => doc(db, 'pushTokens', uid);
+
+// --- sendPushTo(): mirrors lib/notifications.ts — a plain HTTPS call to
+// Expo's push API using the recipient's stored token. Sending needs no
+// native SDK, only registering/receiving does, so this works unchanged
+// from a plain web page. ---
+async function sendPushTo(uid, title, body, data) {
+  try {
+    const snap = await getDoc(tokenRef(uid));
+    const token = snap.exists() ? snap.data().token : null;
+    if (!token) return;
+    await fetch('https://exp.host/--/api/v2/push/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ to: token, title, body, data, sound: 'default' }),
+    });
+  } catch {
+    // Best-effort — same as the native version.
+  }
+}
+
+// --- checkFillMilestones(): mirrors lib/groupDraws.ts's 50%/100% host alert ---
+async function checkFillMilestones(code, drawData) {
+  try {
+    const notifyAt50 = drawData.notifyAt50 !== false;
+    const notifyAt100 = drawData.notifyAt100 !== false;
+    if (!notifyAt50 && !notifyAt100) return;
+
+    const entriesSnap = await getDocs(entriesCol(code));
+    const total = entriesSnap.size;
+    if (!total) return;
+    const claimed = entriesSnap.docs.filter(d => { const x = d.data(); return x.claimedBy || x.label; }).length;
+    const pct = (claimed / total) * 100;
+
+    if (pct >= 100 && !drawData.notified100 && notifyAt100) {
+      await updateDoc(drawRef(code), { notified50: true, notified100: true });
+      sendPushTo(drawData.hostId, drawData.title, `${claimed} of ${total} claimed — the draw is full!`, { code, screen: 'group-host' });
+      const participants = new Set();
+      entriesSnap.docs.forEach(d => {
+        const uid = d.data().claimedBy;
+        if (uid) participants.add(uid);
+      });
+      participants.forEach(uid =>
+        sendPushTo(uid, drawData.title, `The draw is full — the winner will be drawn soon!`, { code, screen: 'group-participant' })
+      );
+    } else if (pct >= 50 && !drawData.notified50 && notifyAt50) {
+      await updateDoc(drawRef(code), { notified50: true });
+      sendPushTo(drawData.hostId, drawData.title, `${claimed} of ${total} claimed — ${Math.round(pct)}% full`, { code, screen: 'group-host' });
+    }
+  } catch {
+    // Best-effort — a missed milestone alert isn't worth surfacing an error for.
+  }
+}
 
 const toDraw = (id, data) => ({
   code: id,
@@ -110,6 +163,10 @@ async function claimEntry(code, number, label) {
       claimedBy: me,
       claimedAt: new Date().toISOString(),
     });
+    if (drawData.notifyOnClaim !== false) {
+      sendPushTo(drawData.hostId, drawData.title, `${trimmed.slice(0, 20)} claimed #${number}`, { code, screen: 'group-host' });
+    }
+    checkFillMilestones(code, drawData);
     return { ok: true };
   } catch {
     const entrySnap = await getDoc(entryRef(code, number));
